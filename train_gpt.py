@@ -26,7 +26,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.checkpoint import checkpoint
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -621,62 +620,84 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
-class Expert(nn.Module):
-    def __init__(self, hidden_dim: int, inner_dim: int):
-        super().__init__()
-        self.fc = CastedLinear(hidden_dim, inner_dim, bias=False)
-        self.proj = CastedLinear(inner_dim, hidden_dim, bias=False)
-        self.proj._zero_init = True
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.proj(F.gelu(self.fc(x)))
-
-
 class DynamicExpertPool(nn.Module):
-    # Shared expert pool: experts + decay are shared across layers.
-    # Router is per-layer and passed in at forward time.
+    # Shared expert pool with batched matmul and closed-form parallel fitness scan.
+    # All E experts are fused into single (E, hidden, inner) weight tensors —
+    # no Python loop over experts, no graph breaks, fully torch.compile-friendly.
     def __init__(self, hidden_dim: int, num_experts: int, inner_dim: int, decay_init: float = 0.9):
         super().__init__()
         self.num_experts = num_experts
-        self.experts = nn.ModuleList([Expert(hidden_dim, inner_dim) for _ in range(num_experts)])
+        self.hidden_dim = hidden_dim
+        self.inner_dim = inner_dim
+        # Batched expert weights: (E, hidden_dim, inner_dim) and (E, inner_dim, hidden_dim)
+        # fc_weight: input projection for all experts fused
+        # proj_weight: output projection for all experts fused, zero-init
+        self.fc_weight = nn.Parameter(torch.empty(num_experts, hidden_dim, inner_dim))
+        self.proj_weight = nn.Parameter(torch.zeros(num_experts, inner_dim, hidden_dim))
         self.decay = nn.Parameter(torch.tensor(decay_init, dtype=torch.float32))
+        # Initialize fc_weight with kaiming uniform (same as nn.Linear default)
+        nn.init.kaiming_uniform_(self.fc_weight.view(num_experts * hidden_dim, inner_dim))
+        self.fc_weight.data = self.fc_weight.data.view(num_experts, hidden_dim, inner_dim)
 
     def forward(self, x: Tensor, fitness: Tensor, router: nn.Module) -> tuple[Tensor, Tensor]:
-        # x: (batch, seq_len, hidden_dim), fitness: (batch, num_experts)
-        # router: per-layer Linear(hidden_dim + E, E), passed from DERTBlock
+        # x:       (batch, seq_len, hidden_dim)
+        # fitness: (batch, num_experts) — float32 running state
+        # router:  per-layer Linear(hidden_dim + E, E), passed from DERTBlock
         bsz, seq_len, hidden_dim = x.shape
+        E = self.num_experts
         decay = self.decay.clamp(0.0, 1.0)
 
-        # Compute all expert outputs in parallel: (batch, seq_len, E, hidden_dim)
-        expert_outs = torch.stack([expert(x) for expert in self.experts], dim=2)
+        # --- Batched expert forward (no Python loop) ---
+        # Cast weights to x dtype for bf16 compute, keep params in fp32 for optimizer
+        fc_w = self.fc_weight.to(x.dtype)    # (E, hidden, inner)
+        proj_w = self.proj_weight.to(x.dtype) # (E, inner, hidden)
 
-        # Compute magnitudes: (batch, seq_len, E)
-        magnitudes = expert_outs.norm(dim=-1)
+        # fc: (batch, seq, hidden) x (E, hidden, inner) -> (batch, seq, E, inner)
+        h = torch.einsum('bsd,edi->bsei', x, fc_w)
+        h = F.gelu(h)
+        # proj: (batch, seq, E, inner) x (E, inner, hidden) -> (batch, seq, E, hidden)
+        expert_outs = torch.einsum('bsei,eih->bseh', h, proj_w)
+
+        # --- Closed-form parallel fitness scan (no Python loop) ---
+        # Recurrence: f[t] = decay * f[t-1] + (1-decay) * m[t]
+        # Closed form: f[t] = decay^(t+1) * f[0] + (1-decay) * sum_{i=0}^{t} decay^(t-i) * m[i]
+        # Implemented via cumsum trick: multiply by decay^(-t), cumsum, multiply back
+        magnitudes = expert_outs.detach().norm(dim=-1).float()  # (batch, seq, E), fp32, detached
         magnitudes = magnitudes / (magnitudes.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # Fitness scan: sequential on small tensors (batch, E), detached
-        fitness_seq = []
-        f = fitness
-        for t in range(seq_len):
-            f = (decay * f + (1 - decay) * magnitudes[:, t, :]).clamp(1e-6, 1.0)
-            f = f / f.sum(dim=-1, keepdim=True)
-            fitness_seq.append(f.detach())
-        fitness_seq = torch.stack(fitness_seq, dim=1)  # (batch, seq_len, E)
+        # Precompute decay powers for positions 0..seq_len-1
+        t_idx = torch.arange(seq_len, device=x.device, dtype=torch.float32)
+        decay_pow = decay ** t_idx  # (seq_len,)
 
-        # Shift fitness by 1: position t uses fitness from t-1
+        # Weighted magnitudes scaled by inverse decay powers for cumsum
+        # shape: (batch, seq, E)
+        inv_decay = (1.0 / (decay_pow + 1e-12)).unsqueeze(0).unsqueeze(-1)
+        scaled_m = magnitudes * (1.0 - decay) * inv_decay
+        cumsum_m = torch.cumsum(scaled_m, dim=1)  # (batch, seq, E)
+
+        # fitness_seq[t] = decay^(t+1)*f0 + decay^t * cumsum_m[t]
+        decay_pow_t = decay_pow.unsqueeze(0).unsqueeze(-1)   # (1, seq, 1)
+        f0_contrib = (decay ** (t_idx + 1)).unsqueeze(0).unsqueeze(-1) * fitness.unsqueeze(1).float()
+        fitness_seq = f0_contrib + decay_pow_t * cumsum_m  # (batch, seq, E)
+
+        # Clamp and renormalize
+        fitness_seq = fitness_seq.clamp(1e-6, 1.0)
+        fitness_seq = fitness_seq / fitness_seq.sum(dim=-1, keepdim=True)
+
+        # --- Router using shifted fitness (t uses f[t-1]) ---
+        # fitness_input[t=0] = initial fitness, fitness_input[t>0] = fitness_seq[t-1]
         fitness_input = torch.cat([
-            fitness.unsqueeze(1),   # (batch, 1, E) — initial fitness for t=0
-            fitness_seq[:, :-1, :], # (batch, seq_len-1, E) — f[t-1] for t=1..T
-        ], dim=1)  # (batch, seq_len, E)
+            fitness.unsqueeze(1).to(x.dtype),         # (batch, 1, E)
+            fitness_seq[:, :-1, :].to(x.dtype),       # (batch, seq-1, E)
+        ], dim=1)  # (batch, seq, E)
 
-        # Router over all positions at once
-        router_input = torch.cat([x, fitness_input], dim=-1)  # (batch, seq_len, hidden+E)
-        weights = F.softmax(router(router_input), dim=-1)  # (batch, seq_len, E)
+        router_input = torch.cat([x, fitness_input], dim=-1)  # (batch, seq, hidden+E)
+        weights = F.softmax(router(router_input), dim=-1)      # (batch, seq, E)
 
         # Weighted sum of expert outputs
-        out = torch.einsum('bse,bsed->bsd', weights, expert_outs)
+        out = torch.einsum('bse,bseh->bsd', weights, expert_outs)
 
-        return out, fitness_seq[:, -1, :]
+        return out, fitness_seq[:, -1, :].detach()
 
 
 class Block(nn.Module):
@@ -890,27 +911,21 @@ class DERTGPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
 
-        # Initialize fitness to uniform (1/E) at start of each sequence.
-        # Keep as float32 to match decay parameter dtype and avoid repeated upcasting.
+        # Initialize fitness to uniform (1/E) at start of each sequence
         fitness = torch.full(
             (bsz, self.num_experts), 1.0 / self.num_experts,
-            device=x.device, dtype=torch.float32,
+            device=x.device, dtype=x.dtype,
         )
 
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x, fitness = checkpoint(
-                self.blocks[i], x, x0, self._get_attn(i), self.expert_pool, fitness,
-                use_reentrant=False,
-            )
+            x, fitness = self.blocks[i](x, x0, self._get_attn(i), self.expert_pool, fitness)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x, fitness = checkpoint(
-                self.blocks[self.num_encoder_layers + i],
+            x, fitness = self.blocks[self.num_encoder_layers + i](
                 x, x0, self._get_attn(self.num_encoder_layers + i), self.expert_pool, fitness,
-                use_reentrant=False,
             )
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
@@ -1078,7 +1093,7 @@ def main() -> None:
     if master_process:
         count_params(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=True) if distributed else compiled_model
 
     # Optimizer split: collect all params except tok_emb and lm_head,
     # then split into matrix (Muon) and scalar (Adam) groups.
@@ -1095,7 +1110,7 @@ def main() -> None:
     scalar_params = [
         p
         for name, p in model_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
@@ -1131,7 +1146,8 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "

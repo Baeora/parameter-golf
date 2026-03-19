@@ -55,13 +55,13 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 512))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Model shape.
+    # Model shape (DERT: 512-dim, 32 layers, 8 heads, 4 KV heads).
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 32))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -86,8 +86,14 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # DERT-specific parameters (Dynamic Expert Routing Transformer)
+    num_experts = int(os.environ.get("NUM_EXPERTS", 16))
+    expert_inner_dim = int(os.environ.get("EXPERT_INNER_DIM", 256))
+    recurrent_attn = bool(int(os.environ.get("RECURRENT_ATTN", "1")))
+    fitness_decay_init = float(os.environ.get("FITNESS_DECAY_INIT", 0.9))
+
 # -----------------------------
-# MUON OPTIMIZER 
+# MUON OPTIMIZER
 # -----------------------------
 # 
 # As borrowed from modded-nanogpt
@@ -289,7 +295,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,decay",
     ).split(",")
     if pattern
 )
@@ -591,14 +597,11 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        if self.num_kv_heads != self.num_heads:
+            reps = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(reps, dim=1)
+            v = v.repeat_interleave(reps, dim=1)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -615,6 +618,64 @@ class MLP(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
+
+
+class Expert(nn.Module):
+    def __init__(self, hidden_dim: int, inner_dim: int):
+        super().__init__()
+        self.fc = CastedLinear(hidden_dim, inner_dim, bias=False)
+        self.proj = CastedLinear(inner_dim, hidden_dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.proj(F.gelu(self.fc(x)))
+
+
+class DynamicExpertPool(nn.Module):
+    # Shared expert pool: experts + decay are shared across layers.
+    # Router is per-layer and passed in at forward time.
+    def __init__(self, hidden_dim: int, num_experts: int, inner_dim: int, decay_init: float = 0.9):
+        super().__init__()
+        self.num_experts = num_experts
+        self.experts = nn.ModuleList([Expert(hidden_dim, inner_dim) for _ in range(num_experts)])
+        self.decay = nn.Parameter(torch.tensor(decay_init, dtype=torch.float32))
+
+    def forward(self, x: Tensor, fitness: Tensor, router: nn.Module) -> tuple[Tensor, Tensor]:
+        # x: (batch, seq_len, hidden_dim), fitness: (batch, num_experts)
+        # router: per-layer Linear(hidden_dim + E, E), passed from DERTBlock
+        bsz, seq_len, hidden_dim = x.shape
+        decay = self.decay.clamp(0.0, 1.0)
+
+        # Compute all expert outputs in parallel: (batch, seq_len, E, hidden_dim)
+        expert_outs = torch.stack([expert(x) for expert in self.experts], dim=2)
+
+        # Compute magnitudes: (batch, seq_len, E)
+        magnitudes = expert_outs.norm(dim=-1)
+        magnitudes = magnitudes / (magnitudes.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # Fitness scan: sequential on small tensors (batch, E), detached
+        fitness_seq = []
+        f = fitness
+        for t in range(seq_len):
+            f = (decay * f + (1 - decay) * magnitudes[:, t, :]).clamp(1e-6, 1.0)
+            f = f / f.sum(dim=-1, keepdim=True)
+            fitness_seq.append(f.detach())
+        fitness_seq = torch.stack(fitness_seq, dim=1)  # (batch, seq_len, E)
+
+        # Shift fitness by 1: position t uses fitness from t-1
+        fitness_input = torch.cat([
+            fitness.unsqueeze(1),   # (batch, 1, E) — initial fitness for t=0
+            fitness_seq[:, :-1, :], # (batch, seq_len-1, E) — f[t-1] for t=1..T
+        ], dim=1)  # (batch, seq_len, E)
+
+        # Router over all positions at once
+        router_input = torch.cat([x, fitness_input], dim=-1)  # (batch, seq_len, hidden+E)
+        weights = F.softmax(router(router_input), dim=-1)  # (batch, seq_len, E)
+
+        # Weighted sum of expert outputs
+        out = torch.einsum('bse,bsed->bsd', weights, expert_outs)
+
+        return out, fitness_seq[:, -1, :]
 
 
 class Block(nn.Module):
@@ -725,6 +786,170 @@ class GPT(nn.Module):
 
 
 # -----------------------------
+# DERT: Dynamic Expert Routing Transformer
+# -----------------------------
+
+class DERTBlock(nn.Module):
+    # Per-layer: norms, scales, resid_mix, router.
+    # Attention and expert pool are passed in (shared or per-layer).
+    def __init__(self, dim: int, num_experts: int):
+        super().__init__()
+        self.attn_norm = RMSNorm()
+        self.mlp_norm = RMSNorm()
+        self.router = CastedLinear(dim + num_experts, num_experts, bias=False)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+
+    def forward(
+        self, x: Tensor, x0: Tensor, attn: nn.Module,
+        expert_pool: DynamicExpertPool, fitness: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_out = attn(self.attn_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        mlp_input = self.mlp_norm(x)
+        mlp_out, fitness = expert_pool(mlp_input, fitness, self.router)
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        return x, fitness
+
+
+class DERTGPT(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        num_layers: int,
+        model_dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        num_experts: int,
+        expert_inner_dim: int,
+        tie_embeddings: bool,
+        tied_embed_init_std: float,
+        logit_softcap: float,
+        rope_base: float,
+        qk_gain_init: float,
+        recurrent_attn: bool,
+        fitness_decay_init: float,
+    ):
+        super().__init__()
+        if logit_softcap <= 0.0:
+            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        self.tie_embeddings = tie_embeddings
+        self.tied_embed_init_std = tied_embed_init_std
+        self.logit_softcap = logit_softcap
+        self.num_experts = num_experts
+        self.recurrent_attn = recurrent_attn
+        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+
+        # Shared expert pool across all layers
+        self.expert_pool = DynamicExpertPool(model_dim, num_experts, expert_inner_dim, fitness_decay_init)
+
+        # Shared or per-layer attention
+        if recurrent_attn:
+            self.shared_attn = CausalSelfAttention(model_dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        else:
+            self.shared_attn = None
+            self.attns = nn.ModuleList([
+                CausalSelfAttention(model_dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+                for _ in range(num_layers)
+            ])
+
+        # U-Net skip structure (preserved from baseline)
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+
+        # Blocks: per-layer norms, scales, resid_mix, router
+        self.blocks = nn.ModuleList([DERTBlock(model_dim, num_experts) for _ in range(num_layers)])
+
+        self.final_norm = RMSNorm()
+        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+        if self.lm_head is not None:
+            self.lm_head._zero_init = True
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        if self.tie_embeddings:
+            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        for module in self.modules():
+            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
+                nn.init.zeros_(module.weight)
+
+    def _get_attn(self, layer_idx: int) -> nn.Module:
+        if self.shared_attn is not None:
+            return self.shared_attn
+        return self.attns[layer_idx]
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        bsz = input_ids.shape[0]
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+
+        # Initialize fitness to uniform (1/E) at start of each sequence
+        fitness = torch.full(
+            (bsz, self.num_experts), 1.0 / self.num_experts,
+            device=x.device, dtype=x.dtype,
+        )
+
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            x, fitness = self.blocks[i](x, x0, self._get_attn(i), self.expert_pool, fitness)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x, fitness = self.blocks[self.num_encoder_layers + i](
+                x, x0, self._get_attn(self.num_encoder_layers + i), self.expert_pool, fitness,
+            )
+
+        x = self.final_norm(x).reshape(-1, x.size(-1))
+        targets = target_ids.reshape(-1)
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(x)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+
+# -----------------------------
+# PARAMETER AUDIT
+# -----------------------------
+
+def count_params(model: nn.Module, script_size_kb: float = 50.0) -> dict:
+    """Print total params and estimate artifact size (int8 + script overhead)."""
+    # Use id() to count unique parameters (handles weight tying)
+    unique = {id(p): p for p in model.parameters()}
+    total_params = sum(p.numel() for p in model.parameters())
+    unique_params = sum(p.numel() for p in unique.values())
+    int8_bytes = unique_params  # 1 byte per param at int8
+    script_bytes = int(script_size_kb * 1024)
+    total_bytes = int8_bytes + script_bytes
+    mb = total_bytes / (1024 * 1024)
+    print(f"Parameter Audit:")
+    print(f"  Total params (with ties counted multiply): {total_params:,}")
+    print(f"  Unique params: {unique_params:,}")
+    print(f"  Estimated int8 size: {int8_bytes:,} bytes ({int8_bytes / 1024 / 1024:.2f} MB)")
+    print(f"  Script overhead: {script_bytes:,} bytes ({script_size_kb:.1f} KB)")
+    print(f"  Estimated total artifact: {total_bytes:,} bytes ({mb:.2f} MB)")
+    print(f"  Fits in 16MB: {'YES' if mb < 16.0 else 'NO'}")
+    # Per-module breakdown
+    print(f"  Per-module breakdown:")
+    for name, module in model.named_children():
+        mod_params = sum(p.numel() for p in module.parameters())
+        mod_unique = sum(p.numel() for p in {id(p): p for p in module.parameters()}.values())
+        if mod_params > 0:
+            print(f"    {name}: {mod_unique:,} unique params" + (f" ({mod_params:,} with ties)" if mod_params != mod_unique else ""))
+    return {"unique_params": unique_params, "total_mb": mb, "fits": mb < 16.0}
+
+
+# -----------------------------
 # TRAINING
 # -----------------------------
 
@@ -823,44 +1048,48 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    base_model = GPT(
+    base_model = DERTGPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
+        num_experts=args.num_experts,
+        expert_inner_dim=args.expert_inner_dim,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        recurrent_attn=args.recurrent_attn,
+        fitness_decay_init=args.fitness_decay_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    if master_process:
+        count_params(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    # Optimizer split:
-    # - token embedding (Adam) uses EMBED_LR
-    # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
-    # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    # Optimizer split: collect all params except tok_emb and lm_head,
+    # then split into matrix (Muon) and scalar (Adam) groups.
+    # This captures blocks, expert_pool, and shared_attn params.
+    model_named_params = [
+        (name, p) for name, p in base_model.named_parameters()
+        if not name.startswith("tok_emb") and not name.startswith("lm_head")
+    ]
     matrix_params = [
         p
-        for name, p in block_named_params
+        for name, p in model_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
-        for name, p in block_named_params
+        for name, p in model_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -959,6 +1188,7 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        torch.cuda.empty_cache()
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -970,6 +1200,7 @@ def main() -> None:
     t0 = time.perf_counter()
 
     step = 0
+    log0("Starting training loop (eager mode, torch.compile disabled)")
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 

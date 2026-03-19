@@ -26,6 +26,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.checkpoint import checkpoint
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -889,21 +890,27 @@ class DERTGPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
 
-        # Initialize fitness to uniform (1/E) at start of each sequence
+        # Initialize fitness to uniform (1/E) at start of each sequence.
+        # Keep as float32 to match decay parameter dtype and avoid repeated upcasting.
         fitness = torch.full(
             (bsz, self.num_experts), 1.0 / self.num_experts,
-            device=x.device, dtype=x.dtype,
+            device=x.device, dtype=torch.float32,
         )
 
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x, fitness = self.blocks[i](x, x0, self._get_attn(i), self.expert_pool, fitness)
+            x, fitness = checkpoint(
+                self.blocks[i], x, x0, self._get_attn(i), self.expert_pool, fitness,
+                use_reentrant=False,
+            )
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x, fitness = self.blocks[self.num_encoder_layers + i](
+            x, fitness = checkpoint(
+                self.blocks[self.num_encoder_layers + i],
                 x, x0, self._get_attn(self.num_encoder_layers + i), self.expert_pool, fitness,
+                use_reentrant=False,
             )
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
@@ -1070,7 +1077,7 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     if master_process:
         count_params(base_model)
-    compiled_model = base_model  # torch.compile disabled for debugging
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split: collect all params except tok_emb and lm_head,
@@ -1124,8 +1131,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
